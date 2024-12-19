@@ -16,59 +16,139 @@ class _YoutubeToMp3ConverterState extends State<YoutubeToMp3Converter> {
   bool isLoading = false;
   double progress = 0.0;
   String? downloadUrl;
+  String? videoTitle;
 
   // Custom colors
-  final primaryColor = const Color(0xFF6C63FF); // Modern purple
-  final secondaryColor = const Color(0xFF2C3E50); // Dark blue-gray
-  final accentColor = const Color(0xFF00B894); // Mint green
-  final backgroundColor = const Color(0xFF1A1A2E); // Dark navy
-  final cardColor = const Color(0xFF16213E); // Slightly lighter navy
+  final primaryColor = const Color(0xFF6C63FF);
+  final secondaryColor = const Color(0xFF2C3E50);
+  final accentColor = const Color(0xFF00B894);
+  final backgroundColor = const Color(0xFF1A1A2E);
+  final cardColor = const Color(0xFF16213E);
+
+  // API configuration
+  // TODO: Replace with your Render deployment URL
+  final apiBaseUrl = 'https://your-render-url.onrender.com';
+
+  bool _isValidYoutubeUrl(String url) {
+    return url.contains('youtube.com/watch?v=') ||
+        url.contains('youtu.be/') ||
+        url.contains('youtube.com/shorts/');
+  }
+
+  void _showError(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: Colors.red.shade700,
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+      ),
+    );
+  }
 
   Future<void> convertVideo() async {
-    final youtubeUrl = _urlController.text;
+    final youtubeUrl = _urlController.text.trim();
 
     if (youtubeUrl.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: const Text("Please enter a YouTube URL"),
-          backgroundColor: secondaryColor,
-          behavior: SnackBarBehavior.floating,
-          shape:
-              RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-        ),
-      );
+      _showError("Please enter a YouTube URL");
+      return;
+    }
+
+    if (!_isValidYoutubeUrl(youtubeUrl)) {
+      _showError("Please enter a valid YouTube URL");
       return;
     }
 
     setState(() {
       isLoading = true;
       downloadUrl = null;
+      videoTitle = null;
       progress = 0.0;
     });
 
     try {
-      for (int i = 0; i <= 100; i++) {
-        await Future.delayed(const Duration(milliseconds: 50));
-        setState(() {
-          progress = i / 100;
-        });
-      }
+      // Simulated progress for better UX
+      final progressTimer = Stream.periodic(
+        const Duration(milliseconds: 100),
+        (i) => i / 100,
+      ).take(80).listen((p) {
+        if (mounted && isLoading) {
+          setState(() => progress = p);
+        }
+      });
 
       final response = await http.post(
-        Uri.parse('https://youtubeflask-1.onrender.com/convert'), // Updated URL
+        Uri.parse('$apiBaseUrl/convert'),
         body: {'url': youtubeUrl},
+      ).timeout(
+        const Duration(seconds: 30),
+        onTimeout: () {
+          throw TimeoutException();
+        },
       );
+
+      await progressTimer.cancel();
 
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
         setState(() {
           downloadUrl = data['mp3Link'];
+          videoTitle = data['title'];
+          progress = 1.0;
+        });
+      } else if (response.statusCode == 429) {
+        _showError("Too many requests. Please wait a moment and try again.");
+      } else {
+        final data = jsonDecode(response.body);
+        _showError(data['error'] ?? "Conversion failed. Please try again.");
+      }
+    } on TimeoutException {
+      _showError("Request timed out. Please try again.");
+    } catch (e) {
+      _showError("An error occurred: ${e.toString()}");
+    } finally {
+      if (mounted) {
+        setState(() {
+          isLoading = false;
+          if (downloadUrl == null) progress = 0.0;
+        });
+      }
+    }
+  }
+
+  Future<void> _launchDownloadUrl() async {
+    if (downloadUrl == null) return;
+
+    final uri = Uri.parse('$apiBaseUrl$downloadUrl');
+    try {
+      if (await canLaunchUrl(uri)) {
+        await launchUrl(uri);
+        setState(() {
+          _urlController.clear();
+          downloadUrl = null;
+          videoTitle = null;
+        });
+      } else {
+        _showError("Could not launch download link.");
+      }
+    } catch (e) {
+      _showError("Error launching download: ${e.toString()}");
+    }
+  }
+
+  Future<void> _pasteClipboardContent() async {
+    try {
+      final clipboardText = await Clipboard.getData('text/plain');
+      if (clipboardText?.text?.isNotEmpty ?? false) {
+        setState(() {
+          _urlController.text = clipboardText!.text!;
         });
       } else {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: const Text("Conversion failed. Please try again."),
-            backgroundColor: Colors.red.shade700,
+            content: const Text("Clipboard is empty."),
+            backgroundColor: secondaryColor,
             behavior: SnackBarBehavior.floating,
             shape:
                 RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
@@ -76,59 +156,7 @@ class _YoutubeToMp3ConverterState extends State<YoutubeToMp3Converter> {
         );
       }
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text("Error: $e"),
-          backgroundColor: Colors.red.shade700,
-          behavior: SnackBarBehavior.floating,
-          shape:
-              RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-        ),
-      );
-    } finally {
-      setState(() {
-        isLoading = false;
-      });
-    }
-  }
-
-  Future<void> _launchDownloadUrl() async {
-    if (downloadUrl != null) {
-      final uri = Uri.parse(downloadUrl!);
-      if (await canLaunchUrl(uri)) {
-        await launchUrl(uri);
-        setState(() {
-          _urlController.clear();
-          downloadUrl = null;
-        });
-      } else {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: const Text("Could not launch download link."),
-            backgroundColor: Colors.red.shade700,
-            behavior: SnackBarBehavior.floating,
-            shape:
-                RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-          ),
-        );
-      }
-    }
-  }
-
-  Future<void> _pasteClipboardContent() async {
-    final clipboardText = await Clipboard.getData('text/plain');
-    if (clipboardText != null && clipboardText.text != null) {
-      _urlController.text = clipboardText.text!;
-    } else {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: const Text("Clipboard is empty."),
-          backgroundColor: secondaryColor,
-          behavior: SnackBarBehavior.floating,
-          shape:
-              RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-        ),
-      );
+      _showError("Could not access clipboard");
     }
   }
 
@@ -169,11 +197,8 @@ class _YoutubeToMp3ConverterState extends State<YoutubeToMp3Converter> {
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      Icon(
-                        Icons.music_note_rounded,
-                        size: 48,
-                        color: primaryColor,
-                      ),
+                      Icon(Icons.music_note_rounded,
+                          size: 48, color: primaryColor),
                       const SizedBox(height: 20),
                       Text(
                         'Convert YouTube to MP3',
@@ -183,6 +208,17 @@ class _YoutubeToMp3ConverterState extends State<YoutubeToMp3Converter> {
                           fontWeight: FontWeight.bold,
                         ),
                       ),
+                      if (videoTitle != null) ...[
+                        const SizedBox(height: 15),
+                        Text(
+                          videoTitle!,
+                          style: TextStyle(
+                            color: Colors.white.withOpacity(0.7),
+                            fontSize: 16,
+                          ),
+                          textAlign: TextAlign.center,
+                        ),
+                      ],
                       const SizedBox(height: 30),
                       Row(
                         children: [
@@ -195,10 +231,8 @@ class _YoutubeToMp3ConverterState extends State<YoutubeToMp3Converter> {
                                 labelStyle: TextStyle(
                                   color: Colors.white.withOpacity(0.7),
                                 ),
-                                prefixIcon: Icon(
-                                  Icons.link_rounded,
-                                  color: primaryColor,
-                                ),
+                                prefixIcon: Icon(Icons.link_rounded,
+                                    color: primaryColor),
                                 border: OutlineInputBorder(
                                   borderRadius: BorderRadius.circular(15),
                                 ),
@@ -324,4 +358,15 @@ class _YoutubeToMp3ConverterState extends State<YoutubeToMp3Converter> {
       ),
     );
   }
+
+  @override
+  void dispose() {
+    _urlController.dispose();
+    super.dispose();
+  }
+}
+
+class TimeoutException implements Exception {
+  @override
+  String toString() => 'The request timed out';
 }
