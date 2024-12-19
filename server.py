@@ -26,9 +26,12 @@ def convert():
         
         logging.info(f"Received YouTube URL: {youtube_url}")
         
-        # Use yt-dlp to extract the video title only
+        # Path to the cookies.txt file (exported from your browser)
+        cookies_path = "path/to/your/cookies.txt"  # Update with the correct path
+        
+        # Use yt-dlp to extract the video title with cookies for authentication
         result = subprocess.run(
-            ["yt-dlp", "--get-title", youtube_url],
+            ["yt-dlp", "--get-title", "--cookies", cookies_path, youtube_url],
             capture_output=True, text=True, check=True
         )
         video_title = result.stdout.strip()
