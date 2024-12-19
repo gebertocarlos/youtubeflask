@@ -6,9 +6,8 @@ import re
 import logging
 import tempfile
 from functools import wraps
-from werkzeug.utils import secure_filename
-import hashlib
 import time
+from werkzeug.utils import secure_filename
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -21,56 +20,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Configure rate limiting
-RATE_LIMIT = 60  # seconds
-rate_limit_dict = {}
+# Configure yt-dlp options
+YT_DLP_OPTIONS = [
+    '--no-check-certificates',
+    '--no-warnings',
+    '--extract-audio',
+    '--audio-format', 'mp3',
+    '--audio-quality', '0',
+    '--prefer-ffmpeg',
+    '--no-playlist',
+    '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/93.0.4577.63 Safari/537.36',
+    '--add-header', 'Accept-Language:en-US,en;q=0.9',
+    '--geo-bypass'
+]
 
-def rate_limit(f):
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        ip = request.remote_addr
-        current_time = time.time()
-        
-        if ip in rate_limit_dict:
-            time_passed = current_time - rate_limit_dict[ip]
-            if time_passed < RATE_LIMIT:
-                return jsonify({
-                    "success": False,
-                    "error": f"Rate limit exceeded. Please wait {int(RATE_LIMIT - time_passed)} seconds"
-                }), 429
-        
-        rate_limit_dict[ip] = current_time
-        return f(*args, **kwargs)
-    return decorated_function
-
-# Store video info temporarily with TTL
-class CacheWithTTL:
-    def __init__(self, ttl=3600):  # 1 hour TTL
-        self.cache = {}
-        self.ttl = ttl
-
-    def set(self, key, value):
-        self.cache[key] = {
-            'value': value,
-            'timestamp': time.time()
-        }
-
-    def get(self, key):
-        if key not in self.cache:
-            return None
-        
-        item = self.cache[key]
-        if time.time() - item['timestamp'] > self.ttl:
-            del self.cache[key]
-            return None
-            
-        return item['value']
-
-    def delete(self, key):
-        if key in self.cache:
-            del self.cache[key]
-
-video_info_cache = CacheWithTTL()
+# Store video info temporarily
+video_info_cache = {}
 
 def validate_youtube_url(url):
     youtube_regex = r'^(https?://)?(www\.)?(youtube\.com|youtu\.be)/.+$'
@@ -78,15 +43,17 @@ def validate_youtube_url(url):
         raise ValueError("Invalid YouTube URL format")
     return url
 
+@app.route('/')
+def health_check():
+    return jsonify({"status": "healthy", "message": "YouTube to MP3 converter is running"}), 200
+
 @app.route('/convert', methods=['POST'])
-@rate_limit
 def convert():
     try:
         youtube_url = request.form.get('url')
         if not youtube_url:
             return jsonify({"success": False, "error": "YouTube URL is required"}), 400
 
-        # Validate YouTube URL
         try:
             youtube_url = validate_youtube_url(youtube_url)
         except ValueError as e:
@@ -94,96 +61,110 @@ def convert():
 
         logger.info(f"Processing YouTube URL: {youtube_url}")
 
-        # Extract video title
-        result = subprocess.run(
-            ["yt-dlp", "--get-title", youtube_url],
-            capture_output=True,
-            text=True,
-            check=True
-        )
-        video_title = result.stdout.strip()
-        
+        # First try to get just the title
+        try:
+            result = subprocess.run(
+                ["yt-dlp", "--get-title", "--no-warnings"] + YT_DLP_OPTIONS + [youtube_url],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            video_title = result.stdout.strip()
+        except subprocess.CalledProcessError as e:
+            if "Sign in to confirm you're not a bot" in e.stderr:
+                return jsonify({
+                    "success": False,
+                    "error": "YouTube bot detection triggered. Please try again later."
+                }), 429
+            elif "Video unavailable" in e.stderr:
+                return jsonify({
+                    "success": False,
+                    "error": "This video is unavailable or private."
+                }), 400
+            else:
+                logger.error(f"Error getting video title: {e.stderr}")
+                return jsonify({
+                    "success": False,
+                    "error": "Unable to process this video. Please try another."
+                }), 500
+
         # Generate a unique identifier for the video
-        identifier = hashlib.md5(f"{youtube_url}_{time.time()}".encode()).hexdigest()
-        
-        # Sanitize the video title
         sanitized_title = secure_filename(video_title)
         
-        # Store in cache
-        video_info_cache.set(identifier, {
+        # Store the URL and title mapping for later use
+        video_info_cache[sanitized_title] = {
             'url': youtube_url,
-            'title': sanitized_title
-        })
+            'title': video_title
+        }
 
-        download_url = f"/download/{identifier}"
+        # Return the download link
+        download_url = f"/download/{sanitized_title}"
         return jsonify({
             "success": True,
             "mp3Link": download_url,
-            "title": sanitized_title
+            "title": video_title
         })
 
-    except subprocess.CalledProcessError as e:
-        logger.error(f"yt-dlp error: {e.stderr}")
-        return jsonify({
-            "success": False,
-            "error": "Failed to process YouTube video"
-        }), 500
     except Exception as e:
         logger.error(f"Unexpected error: {str(e)}")
         return jsonify({
             "success": False,
-            "error": "An unexpected error occurred"
+            "error": "An unexpected error occurred. Please try again."
         }), 500
 
-@app.route('/download/<identifier>', methods=['GET'])
-@rate_limit
-def download_file(identifier):
+@app.route('/download/<filename>')
+def download_file(filename):
     try:
-        video_info = video_info_cache.get(identifier)
-        if not video_info:
+        if filename not in video_info_cache:
             return jsonify({
                 "success": False,
                 "error": "Download link expired or invalid"
             }), 404
 
+        video_info = video_info_cache[filename]
         youtube_url = video_info['url']
-        sanitized_title = video_info['title']
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            output_file = os.path.join(temp_dir, f"{sanitized_title}.mp3")
+            output_file = os.path.join(temp_dir, f"{filename}.mp3")
             
-            # Download and convert the file
-            subprocess.run([
-                "yt-dlp",
-                "-x",
-                "--audio-format", "mp3",
-                "--audio-quality", "0",
-                "-o", output_file,
-                youtube_url
-            ], check=True)
+            try:
+                # Download and convert the file
+                subprocess.run(
+                    ["yt-dlp"] + YT_DLP_OPTIONS + ["-o", output_file, youtube_url],
+                    check=True,
+                    capture_output=True,
+                    text=True
+                )
+            except subprocess.CalledProcessError as e:
+                logger.error(f"Error in downloading file: {e.stderr}")
+                if "Sign in to confirm you're not a bot" in e.stderr:
+                    return jsonify({
+                        "success": False,
+                        "error": "YouTube bot detection triggered. Please try again later."
+                    }), 429
+                return jsonify({
+                    "success": False,
+                    "error": "Failed to download the video. Please try again."
+                }), 500
 
-            logger.info(f"Successfully processed: {sanitized_title}")
+            logger.info(f"Successfully processed: {filename}")
             
             return send_file(
                 output_file,
                 as_attachment=True,
-                download_name=f"{sanitized_title}.mp3"
+                download_name=f"{filename}.mp3"
             )
 
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Download error: {e.stderr}")
-        return jsonify({
-            "success": False,
-            "error": "Failed to download and convert video"
-        }), 500
     except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}")
+        logger.error(f"Error in downloading file: {str(e)}")
         return jsonify({
             "success": False,
-            "error": "An unexpected error occurred"
+            "error": "An unexpected error occurred during download"
         }), 500
     finally:
-        video_info_cache.delete(identifier)
+        # Clean up the video info from cache
+        if filename in video_info_cache:
+            del video_info_cache[filename]
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
